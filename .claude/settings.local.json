@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(grep:*)",
+      "Bash(grep -n \"^[[:space:]]*#.*:\" /c/GitHub/wheeltec_ros2/src/wheeltec_semantic_map/wheeltec_semantic_map/*.py)",
+      "Bash(find C:GitHubwheeltec_ros2 -type f \\\\\\(-name *.py -o -name *.cpp -o -name *.h \\\\\\))",
+      "Bash(cat /c/GitHub/wheeltec_ros2/src/wheeltec_semantic_map/launch/*.py)"
+    ]
+  }
+}
