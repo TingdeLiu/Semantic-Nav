@@ -69,12 +69,14 @@ class ObjectNavigatorNode(Node):
         self.declare_parameter('approach_distance',  0.8)    # metres from object
         self.declare_parameter('search_timeout',    300.0)  # seconds
         self.declare_parameter('search_grace_period', 5.0)  # seconds to wait before exploring
+        self.declare_parameter('max_nav_attempts',   3)     # max re-navigation attempts per task
         self.declare_parameter('web_port',           8080)
         self.declare_parameter('web_enabled',        True)
 
         self.approach_distance   = self.get_parameter('approach_distance').value
         self.search_timeout      = self.get_parameter('search_timeout').value
         self.search_grace_period = self.get_parameter('search_grace_period').value
+        self.max_nav_attempts    = self.get_parameter('max_nav_attempts').value
         web_port    = self.get_parameter('web_port').value
         web_enabled = self.get_parameter('web_enabled').value
 
@@ -92,6 +94,8 @@ class ObjectNavigatorNode(Node):
         self.task_start_time = 0.0
         self._reset_at       = 0.0  # monotonic time to reset IDLE after result
         self.nav_goal_handle = None
+        self._nav_target_lost_since = 0.0  # monotonic time target first disappeared during nav
+        self._nav_attempts   = 0           # re-navigation attempts this task
 
         # ── Subscribers ──────────────────────────────────────────────────────
         self.create_subscription(
@@ -105,7 +109,7 @@ class ObjectNavigatorNode(Node):
             self.create_subscription(
                 ExploreStatus, '/explore/status', self._on_explore_status, 10)
         else:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 'explore_lite_msgs not found – exploration completion '
                 'detection disabled (will rely on timeout instead)')
 
@@ -130,6 +134,7 @@ class ObjectNavigatorNode(Node):
         self.get_logger().info(
             f'ObjectNavigatorNode ready | approach={self.approach_distance}m '
             f'timeout={self.search_timeout}s grace={self.search_grace_period}s '
+            f'max_nav_attempts={self.max_nav_attempts} '
             f'web={web_port if web_enabled else "off"}')
 
     # ── ROS callbacks ─────────────────────────────────────────────────────────
@@ -140,7 +145,7 @@ class ObjectNavigatorNode(Node):
             return
         with self._lock:
             if self.state not in (State.IDLE, State.SUCCESS, State.FAILED):
-                self.get_logger().warn(
+                self.get_logger().warning(
                     f'Busy (state={self.state.name}), ignoring goal "{class_name}"')
                 return
             self._start_task(class_name)
@@ -208,7 +213,8 @@ class ObjectNavigatorNode(Node):
                 self._do_search()
             elif state == State.EXPLORING:
                 self._do_explore_check()
-            # NAVIGATING_TO_OBJECT: handled via Nav2 callbacks, nothing to do here
+            elif state == State.NAVIGATING_TO_OBJECT:
+                self._do_nav_check()
 
     def _do_search(self) -> None:
         found = self._find_in_map(self.target_class)
@@ -244,13 +250,71 @@ class ObjectNavigatorNode(Node):
                 'EXPLORING',
                 f'Exploring ({elapsed:.0f}s elapsed), searching for "{self.target_class}"')
 
+    # Grace period before aborting navigation when target disappears from map.
+    # Transient detection losses (camera angle change, occlusion) are common
+    # during approach; 10 s gives the semantic map time to re-detect the object.
+    _NAV_TARGET_LOST_GRACE = 10.0  # seconds
+
+    def _do_nav_check(self) -> None:
+        """While navigating, abort if the target disappears from the semantic map."""
+        found = self._find_in_map(self.target_class)
+        if found:
+            self._nav_target_lost_since = 0.0
+            # Proximity check: succeed immediately if robot is already close enough,
+            # without waiting for the Nav2 goal to formally complete.
+            try:
+                rx, ry = self._robot_pose()
+                dist = math.hypot(found['x'] - rx, found['y'] - ry)
+                if dist <= self.approach_distance:
+                    self.get_logger().info(
+                        f'Robot reached "{self.target_class}" '
+                        f'({dist:.2f}m ≤ {self.approach_distance}m) – task complete')
+                    self._cancel_nav()
+                    self.state     = State.SUCCESS
+                    self._reset_at = time.monotonic() + 3.0
+                    self._pub_result(True, f'Reached "{self.target_class}"', found)
+                    return
+            except RuntimeError:
+                pass  # TF temporarily unavailable – fall through to normal wait
+            return
+
+        now = time.monotonic()
+        if self._nav_target_lost_since == 0.0:
+            self._nav_target_lost_since = now
+            self.get_logger().debug(
+                f'Target "{self.target_class}" not in map during navigation – '
+                f'grace period started')
+            return
+
+        lost_for = now - self._nav_target_lost_since
+        if lost_for < self._NAV_TARGET_LOST_GRACE:
+            self._pub_feedback(
+                'NAVIGATING',
+                f'Target "{self.target_class}" temporarily absent from map '
+                f'({lost_for:.0f}s/{self._NAV_TARGET_LOST_GRACE:.0f}s grace)')
+            return
+
+        self.get_logger().warning(
+            f'Target "{self.target_class}" absent from semantic map for '
+            f'{lost_for:.0f}s during navigation – cancelling and re-searching '
+            f'(attempt {self._nav_attempts}/{self.max_nav_attempts})')
+        self._cancel_nav()
+        self._nav_target_lost_since = 0.0
+        self.state = State.SEARCHING_MAP
+        self._pub_feedback(
+            'SEARCHING_MAP',
+            f'Target lost during navigation, re-searching for "{self.target_class}" '
+            f'(attempt {self._nav_attempts}/{self.max_nav_attempts})')
+
     # ── Task control ──────────────────────────────────────────────────────────
 
     def _start_task(self, class_name: str) -> None:
-        self.target_class    = class_name
-        self.task_start_time = time.monotonic()
-        self.explore_status  = ''
-        self.state           = State.SEARCHING_MAP
+        self.target_class           = class_name
+        self.task_start_time        = time.monotonic()
+        self.explore_status         = ''
+        self._nav_target_lost_since = 0.0
+        self._nav_attempts          = 0
+        self.state                  = State.SEARCHING_MAP
         self.get_logger().info(f'New navigation task: find "{class_name}"')
         self._pub_feedback('SEARCHING_MAP', f'Searching map for "{class_name}"')
 
@@ -278,13 +342,22 @@ class ObjectNavigatorNode(Node):
         self._stop_exploration()
         self.state     = State.FAILED
         self._reset_at = time.monotonic() + 2.0
-        self.get_logger().warn(f'Task failed: {reason}')
+        self.get_logger().warning(f'Task failed: {reason}')
         self._pub_result(False, reason, None)
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
     def _navigate_to(self, obj: dict) -> None:
         ox, oy = obj['x'], obj['y']
+
+        # Guard against infinite re-navigation loops (e.g. target repeatedly
+        # disappearing / reappearing from semantic map while SLAM is running).
+        self._nav_attempts += 1
+        if self._nav_attempts > self.max_nav_attempts:
+            self._fail(
+                f'Exceeded max navigation attempts ({self.max_nav_attempts}) '
+                f'for "{self.target_class}" – aborting')
+            return
 
         # Approach pose: stop approach_distance metres in front of object.
         # Robot pose must be resolved BEFORE mutating state so that a TF failure
@@ -293,6 +366,17 @@ class ObjectNavigatorNode(Node):
             rx, ry = self._robot_pose()
         except RuntimeError as e:
             self._fail(f'Cannot compute approach pose: {e}')
+            return
+
+        # Already close enough – no need to navigate.
+        dist = math.hypot(ox - rx, oy - ry)
+        if dist <= self.approach_distance:
+            self.get_logger().info(
+                f'Already within approach distance of "{self.target_class}" '
+                f'({dist:.2f}m ≤ {self.approach_distance}m) – task complete')
+            self.state     = State.SUCCESS
+            self._reset_at = time.monotonic() + 3.0
+            self._pub_result(True, f'Reached "{self.target_class}"', obj)
             return
 
         dx, dy = ox - rx, oy - ry
@@ -304,7 +388,8 @@ class ObjectNavigatorNode(Node):
         goal_y = oy - self.approach_distance * dy
         yaw    = math.atan2(oy - goal_y, ox - goal_x)
 
-        self.state = State.NAVIGATING_TO_OBJECT
+        self.state                  = State.NAVIGATING_TO_OBJECT
+        self._nav_target_lost_since = 0.0
         self._pub_feedback(
             'NAVIGATING',
             f'Navigating to "{self.target_class}" at ({ox:.2f}, {oy:.2f})')
@@ -376,7 +461,7 @@ class ObjectNavigatorNode(Node):
                 t = self.tf_buffer.lookup_transform(
                     'map', frame,
                     rclpy.time.Time(),
-                    timeout=Duration(seconds=0.0))  # non-blocking
+                    timeout=Duration(seconds=0.5))
                 return t.transform.translation.x, t.transform.translation.y
             except Exception as e:
                 last_exc = e
@@ -418,7 +503,7 @@ class ObjectNavigatorNode(Node):
         try:
             from flask import Flask, jsonify, request
         except ImportError:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 'Flask not installed – web interface disabled. '
                 'Install with: pip install flask')
             return
@@ -446,11 +531,15 @@ class ObjectNavigatorNode(Node):
 
         @app.route('/status')
         def status():
-            elapsed = (round(time.monotonic() - node.task_start_time, 1)
-                       if node.state != State.IDLE else 0)
+            with node._lock:
+                state_name  = node.state.name
+                is_idle     = node.state == State.IDLE
+                target      = node.target_class
+                start_time  = node.task_start_time
+            elapsed = (round(time.monotonic() - start_time, 1) if not is_idle else 0)
             return jsonify({
-                'state':   node.state.name,
-                'target':  node.target_class,
+                'state':   state_name,
+                'target':  target,
                 'elapsed': elapsed,
             })
 

@@ -10,7 +10,6 @@ Data flow:
         + TF (bbox3d.frame_id → map)
         + /map (OccupancyGrid)
   ──────────────────────────────────
-  → /semantic_map/markers  (visualization_msgs/MarkerArray)  [RViz flat rect markers]
   → /semantic_map/image    (sensor_msgs/Image)               [annotated map image]
   → /semantic_map/objects  (std_msgs/String)                 [JSON object list]
 """
@@ -18,6 +17,7 @@ Data flow:
 import colorsys
 import json
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
@@ -31,8 +31,7 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import Image
-from std_msgs.msg import ColorRGBA, String
-from visualization_msgs.msg import Marker, MarkerArray
+from std_msgs.msg import String
 import tf2_geometry_msgs  # noqa: F401  registers PointStamped transform support
 import tf2_ros
 
@@ -61,6 +60,7 @@ class SemanticObject:
     last_seen: float  # seconds (monotonic clock)
     foot_w: float = _MIN_FOOT   # footprint lateral width  (bbox x-extent, metres)
     foot_d: float = _MIN_FOOT   # footprint forward depth  (bbox z-extent, metres)
+    miss_count: int = 0         # consecutive rescan misses (for grace period)
 
 
 class SemanticMapNode(Node):
@@ -73,20 +73,29 @@ class SemanticMapNode(Node):
         self.declare_parameter('target_frame', 'map')
         self.declare_parameter('detection_topic', '/detections_3d')
         self.declare_parameter('map_topic', '/map')
-        self.declare_parameter('object_timeout', 120.0)  # seconds (unused)
+        self.declare_parameter('object_timeout', 120.0)  # seconds; 0 = disabled
         self.declare_parameter('min_score', 0.8)
         self.declare_parameter('publish_rate', 2.0)      # Hz
-        self.declare_parameter('marker_lifetime', 2.0)   # seconds
         self.declare_parameter('merge_distance', 0.6)    # metres: spatial dedup radius
+        self.declare_parameter('disappear_grace_frames', 3)  # consecutive misses before removal
+        # Persistence
+        _default_map_file = os.path.join(
+            os.path.expanduser('~'), '.ros', 'semantic_map.json')
+        self.declare_parameter('semantic_map_file', _default_map_file)
+        self.declare_parameter('load_on_startup', False)   # load saved map at startup
+        self.declare_parameter('autosave_period', 0.0)     # seconds; 0 = disabled
 
-        self.target_frame    = self.get_parameter('target_frame').value
-        detection_topic      = self.get_parameter('detection_topic').value
-        map_topic            = self.get_parameter('map_topic').value
-        self.object_timeout  = self.get_parameter('object_timeout').value
-        self.min_score       = self.get_parameter('min_score').value
-        publish_rate         = self.get_parameter('publish_rate').value
-        self.marker_lifetime = self.get_parameter('marker_lifetime').value
-        self.merge_distance  = self.get_parameter('merge_distance').value
+        self.target_frame       = self.get_parameter('target_frame').value
+        detection_topic         = self.get_parameter('detection_topic').value
+        map_topic               = self.get_parameter('map_topic').value
+        self.object_timeout     = self.get_parameter('object_timeout').value
+        self.min_score          = self.get_parameter('min_score').value
+        publish_rate            = self.get_parameter('publish_rate').value
+        self.merge_distance           = self.get_parameter('merge_distance').value
+        self.disappear_grace_frames   = self.get_parameter('disappear_grace_frames').value
+        self.semantic_map_file  = self.get_parameter('semantic_map_file').value
+        load_on_startup         = self.get_parameter('load_on_startup').value
+        autosave_period         = self.get_parameter('autosave_period').value
 
         # ── TF ──────────────────────────────────────────────────────────────
         self.tf_buffer   = tf2_ros.Buffer()
@@ -112,8 +121,6 @@ class SemanticMapNode(Node):
             OccupancyGrid, map_topic, self._on_map, _map_qos)
 
         # ── Publishers ──────────────────────────────────────────────────────
-        self.marker_pub  = self.create_publisher(
-            MarkerArray, '/semantic_map/markers', 10)
         self.image_pub   = self.create_publisher(
             Image, '/semantic_map/image', 10)
         self.objects_pub = self.create_publisher(
@@ -121,11 +128,18 @@ class SemanticMapNode(Node):
 
         # ── Timer ───────────────────────────────────────────────────────────
         self.create_timer(1.0 / publish_rate, self._publish)
+        if autosave_period > 0:
+            self.create_timer(autosave_period, self._save_semantic_map)
+
+        # ── Load saved map (localization mode) ───────────────────────────────
+        if load_on_startup:
+            self._load_semantic_map()
 
         self.get_logger().info(
             f'SemanticMapNode ready  |  frame={self.target_frame} '
             f'det={detection_topic}  map={map_topic}  '
-            f'merge_dist={self.merge_distance}m')
+            f'merge_dist={self.merge_distance}m  '
+            f'map_file={self.semantic_map_file}')
 
     # ── Callbacks ────────────────────────────────────────────────────────────
 
@@ -164,7 +178,7 @@ class SemanticMapNode(Node):
                 self.get_logger().debug(f'TF failed ({frame}→{self.target_frame}): {exc}')
                 continue
 
-            mx, my = pt_map.point.x, pt_map.point.y
+            mx, my, mz = pt_map.point.x, pt_map.point.y, pt_map.point.z
             scanned_positions.append((det.class_name, mx, my))
 
             # Footprint: lateral width = bbox x, forward depth = bbox z
@@ -187,48 +201,84 @@ class SemanticMapNode(Node):
             if key is None:
                 key = det.id if det.id else self._next_uid()
 
+            # Position smoothing: blend new measurement with stored position to
+            # reduce per-frame jitter from depth-camera noise (EMA, alpha=0.4).
+            if key in self.objects:
+                prev   = self.objects[key]
+                alpha  = 0.4
+                mx     = (1.0 - alpha) * prev.x + alpha * mx
+                my     = (1.0 - alpha) * prev.y + alpha * my
+                mz     = (1.0 - alpha) * prev.z + alpha * mz
+                foot_w = (1.0 - alpha) * prev.foot_w + alpha * foot_w
+                foot_d = (1.0 - alpha) * prev.foot_d + alpha * foot_d
+
             self.objects[key] = SemanticObject(
                 class_id    = det.class_id,
                 class_name  = det.class_name,
                 tracking_id = key,
                 x           = mx,
                 y           = my,
-                z           = pt_map.point.z,
+                z           = mz,
                 score       = det.score,
                 last_seen   = now_sec,
                 foot_w      = foot_w,
                 foot_d      = foot_d,
+                miss_count  = 0,
             )
             updated_keys.add(key)
 
         # ── Disappearance detection ──────────────────────────────────────
         # For each stored object: if the robot just scanned a nearby area
         # (same class detected within 2×merge_distance) but this object was
-        # NOT matched, it has disappeared → remove it immediately.
+        # NOT matched, increment its miss counter. Only remove after
+        # disappear_grace_frames consecutive misses, to tolerate transient
+        # detection losses (occlusion, camera angle, YOLO variability).
         rescan_radius = self.merge_distance * 2.0
-        vanished = [
-            k for k, obj in self.objects.items()
-            if k not in updated_keys
-            and any(
+        for k, obj in list(self.objects.items()):
+            if k in updated_keys:
+                obj.miss_count = 0  # reset on any successful match
+                continue
+            nearby_same_class = any(
                 cls == obj.class_name
                 and math.hypot(sx - obj.x, sy - obj.y) < rescan_radius
                 for cls, sx, sy in scanned_positions
             )
-        ]
-        for k in vanished:
-            self.get_logger().info(
-                f'Object disappeared on rescan: {self.objects[k].class_name} '
-                f'@ ({self.objects[k].x:.2f}, {self.objects[k].y:.2f})')
-            del self.objects[k]
+            if not nearby_same_class:
+                continue
+            obj.miss_count += 1
+            if obj.miss_count >= self.disappear_grace_frames:
+                self.get_logger().info(
+                    f'Object disappeared on rescan ({obj.miss_count} misses): '
+                    f'{obj.class_name} @ ({obj.x:.2f}, {obj.y:.2f})')
+                del self.objects[k]
+            else:
+                self.get_logger().debug(
+                    f'Object miss {obj.miss_count}/{self.disappear_grace_frames}: '
+                    f'{obj.class_name} @ ({obj.x:.2f}, {obj.y:.2f})')
 
 
     # ── Publishing ───────────────────────────────────────────────────────────
 
     def _publish(self) -> None:
-        self._publish_markers()
+        self._expire_objects()
         self._publish_objects_json()
         if self.map_msg is not None:
             self._publish_image()
+
+    def _expire_objects(self) -> None:
+        """Remove objects that have not been seen within object_timeout seconds."""
+        if self.object_timeout <= 0:
+            return
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        expired = [
+            k for k, obj in self.objects.items()
+            if (now_sec - obj.last_seen) > self.object_timeout
+        ]
+        for k in expired:
+            obj = self.objects.pop(k)
+            self.get_logger().info(
+                f'Object expired ({self.object_timeout:.0f}s): '
+                f'{obj.class_name} @ ({obj.x:.2f}, {obj.y:.2f})')
 
     def _publish_objects_json(self) -> None:
         """Publish all tracked objects as a JSON string for other nodes to query."""
@@ -248,62 +298,13 @@ class SemanticMapNode(Node):
         msg.data = json.dumps(objs)
         self.objects_pub.publish(msg)
 
-    def _publish_markers(self) -> None:
-        array = MarkerArray()
-
-        clear = Marker()
-        clear.action = Marker.DELETEALL
-        array.markers.append(clear)
-
-        stamp = self.get_clock().now().to_msg()
-
-        for idx, obj in enumerate(self.objects.values()):
-            r, g, b, a = class_color(obj.class_name)
-
-            # ── Flat ground rectangle (replaces sphere) ──────────────────
-            rect          = Marker()
-            rect.header.frame_id = self.target_frame
-            rect.header.stamp    = stamp
-            rect.ns     = 'sem_objects'
-            rect.id     = idx * 2
-            rect.type   = Marker.CUBE
-            rect.action = Marker.ADD
-            rect.pose.position.x = obj.x
-            rect.pose.position.y = obj.y
-            rect.pose.position.z = 0.02        # flat slab just above ground
-            rect.pose.orientation.w = 1.0
-            rect.scale.x = obj.foot_w
-            rect.scale.y = obj.foot_d
-            rect.scale.z = 0.04                # thin slab
-            rect.color   = ColorRGBA(r=r, g=g, b=b, a=0.55)
-            rect.lifetime.sec = int(self.marker_lifetime)
-            array.markers.append(rect)
-
-            # ── Text label ───────────────────────────────────────────────
-            text          = Marker()
-            text.header.frame_id = self.target_frame
-            text.header.stamp    = stamp
-            text.ns     = 'sem_labels'
-            text.id     = idx * 2 + 1
-            text.type   = Marker.TEXT_VIEW_FACING
-            text.action = Marker.ADD
-            text.pose.position.x = obj.x
-            text.pose.position.y = obj.y
-            text.pose.position.z = 0.45
-            text.pose.orientation.w = 1.0
-            text.scale.z = 0.18
-            text.color   = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
-            text.text    = f'{obj.class_name} ({obj.score:.2f})'
-            text.lifetime.sec = int(self.marker_lifetime)
-            array.markers.append(text)
-
-        self.marker_pub.publish(array)
-
     def _publish_image(self) -> None:
         """Render the occupancy grid with filled class-coloured bounding boxes."""
         m   = self.map_msg
         w   = m.info.width
         h   = m.info.height
+        if w == 0 or h == 0:
+            return
         res = m.info.resolution       # metres/pixel
         ox  = m.info.origin.position.x
         oy  = m.info.origin.position.y
@@ -392,6 +393,82 @@ class SemanticMapNode(Node):
         uid = f'_auto_{self._uid}'
         self._uid += 1
         return uid
+
+    # ── Persistence ──────────────────────────────────────────────────────────
+
+    def _save_semantic_map(self) -> None:
+        """Persist current semantic objects to JSON file."""
+        if not self.objects:
+            return
+        path = os.path.expanduser(self.semantic_map_file)
+        data = [
+            {
+                'class_id':    obj.class_id,
+                'class_name':  obj.class_name,
+                'tracking_id': obj.tracking_id,
+                'x':           obj.x,
+                'y':           obj.y,
+                'z':           obj.z,
+                'score':       obj.score,
+                'foot_w':      obj.foot_w,
+                'foot_d':      obj.foot_d,
+            }
+            for obj in self.objects.values()
+        ]
+        try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(path, 'w') as f:
+                json.dump(data, f, indent=2)
+            self.get_logger().info(
+                f'Saved {len(data)} semantic objects → {path}')
+        except Exception as exc:
+            self.get_logger().error(f'Failed to save semantic map: {exc}')
+
+    def _load_semantic_map(self) -> None:
+        """Load semantic objects from JSON file into the object dictionary."""
+        path = os.path.expanduser(self.semantic_map_file)
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            self.get_logger().warning(
+                f'Semantic map file not found: {path} (starting with empty map)')
+            return
+        except Exception as exc:
+            self.get_logger().error(f'Failed to load semantic map: {exc}')
+            return
+
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        loaded = 0
+        for item in data:
+            try:
+                obj = SemanticObject(
+                    class_id    = item['class_id'],
+                    class_name  = item['class_name'],
+                    tracking_id = item['tracking_id'],
+                    x           = float(item['x']),
+                    y           = float(item['y']),
+                    z           = float(item['z']),
+                    score       = float(item['score']),
+                    last_seen   = now_sec,
+                    foot_w      = float(item.get('foot_w', _MIN_FOOT)),
+                    foot_d      = float(item.get('foot_d', _MIN_FOOT)),
+                )
+                self.objects[obj.tracking_id] = obj
+                loaded += 1
+            except (KeyError, TypeError, ValueError) as exc:
+                self.get_logger().warning(
+                    f'Skipping malformed entry in semantic map: {exc}')
+
+        self.get_logger().info(
+            f'Loaded {loaded} semantic objects ← {path}')
+
+    def destroy_node(self) -> None:
+        """Save semantic map to disk before shutting down."""
+        self._save_semantic_map()
+        super().destroy_node()
 
 
 def main(args=None) -> None:

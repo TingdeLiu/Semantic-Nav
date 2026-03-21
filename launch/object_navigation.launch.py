@@ -9,8 +9,8 @@ Usage:
   ros2 launch wheeltec_semantic_map object_navigation.launch.py
 
 Assumes Nav2 and SLAM (or RTAB-Map) are already running.
-To also run exploration, launch m-explore-ros2 separately:
-  ros2 launch explore_lite explore.launch.py
+For full-stack exploration + semantic mapping in one command, use:
+  ros2 launch wheeltec_robot_rtab wheeltec_explore_rtab.launch.py
 """
 
 from launch import LaunchDescription

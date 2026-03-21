@@ -53,6 +53,15 @@ YOLO 推理依赖 conda 独立环境，需在启动前激活：
 conda activate yolo
 ```
 
+YOLO 模型文件需放到工作空间根目录：
+
+```bash
+# 下载 yolov8m.pt（约 50 MB）
+wget -P ~/wheeltec_ros2/ https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8m.pt
+```
+
+> 也可手动下载后放到 `~/wheeltec_ros2/yolov8m.pt`。如需使用其他模型，通过 `model:=` 参数指定完整路径。
+
 ---
 
 ## 编译安装
@@ -124,17 +133,11 @@ ros2 launch wheeltec_semantic_map semantic_slam_pure3d.launch.py
 
 ---
 
-### 方式四：语义地图 + 物体导航（含自主探索）
+### 方式四 A：实时建图 + 语义探索（首次探索 / 环境变化后）
 
-使用 `wheeltec_robot_rtab` 内置前沿探索节点，**无需 m-explore-ros2**，仅需 2 个终端：
+使用 `wheeltec_robot_rtab` 内置前沿探索节点实时建图，同步构建语义地图，**关闭时自动保存**到 `~/.ros/semantic_map.json`（每 30 秒也会自动保存一次）。
 
-**终端 1 — 底盘驱动**
-
-```bash
-ros2 launch turn_on_wheeltec_robot turn_on_wheeltec_robot.launch.py
-```
-
-**终端 2 — 完整栈（SLAM + Nav2 + 前沿探索 + YOLO + 语义地图 + 物体导航）**
+**一键启动（底盘驱动 + SLAM + Nav2 + 前沿探索 + YOLO + 语义地图 + 物体导航）**
 
 ```bash
 conda activate yolo
@@ -142,31 +145,63 @@ source ~/wheeltec_ros2/install/setup.bash
 ros2 launch wheeltec_robot_rtab wheeltec_explore_rtab.launch.py
 ```
 
-> 内置的 `frontier_explorer_node` 直接订阅 RTAB-Map 的 `/map`，通过 Nav2 `navigate_to_pose` 驱动探索，并内置前向 ±90° 过滤（只追踪相机能看到的前沿，避免机器人朝相机看不到的方向行进导致语义地图漏检）。
-> `object_navigator_node` 无需任何改动，仍通过 `/explore/resume` 话题控制探索启停。
+> `wheeltec_explore_rtab.launch.py` 内部已通过 `wheeltec_slam_rtab.launch.py` 启动底盘驱动、激光雷达和相机，无需单独开终端。
+
+探索结束后**按 Ctrl+C 关闭**，系统自动保存：
+- RTAB-Map 数据库 → `~/.ros/rtabmap.db`
+- 语义地图 → `~/.ros/semantic_map.json`
+
+> 内置的 `frontier_explorer_node` 只追踪相机前向 ±90° 范围内的前沿，确保语义地图不漏检。
+
+---
+
+### 方式四 B：加载已保存语义地图 + 定位导航（日常使用）
+
+环境已探索过后，无需重新建图。直接加载保存的地图，启动即可导航。
+
+**前置条件**：已完成至少一次方式四 A 的建图，生成了 `~/.ros/rtabmap.db` 和 `~/.ros/semantic_map.json`。
+
+**终端 1 — 底盘驱动**
+
+```bash
+ros2 launch turn_on_wheeltec_robot turn_on_wheeltec_robot.launch.py
+```
+
+**终端 2 — 定位 + 语义导航**
+
+```bash
+conda activate yolo
+source ~/wheeltec_ros2/install/setup.bash
+ros2 launch wheeltec_semantic_map wheeltec_semantic_nav.launch.py
+```
+
+启动后系统自动：
+1. RTAB-Map 加载 `~/.ros/rtabmap.db`，基于激光 + 视觉定位（无需重新建图）
+2. 语义地图节点从 `~/.ros/semantic_map.json` 读取上次保存的所有物体
+3. YOLO 实时检测继续运行——新物体会加入地图，已移走物体会通过主动消失检测自动删除
+4. 关闭时自动将更新后的语义地图写回文件
+
+```bash
+# 指定其他语义地图文件
+ros2 launch wheeltec_semantic_map wheeltec_semantic_nav.launch.py \
+  semantic_map_file:=/home/wheeltec/maps/lab_semantic.json
+```
 
 编译（首次或代码更新后）：
 
 ```bash
-colcon build --packages-select wheeltec_robot_rtab
+colcon build --packages-select wheeltec_semantic_map wheeltec_robot_rtab
 source install/setup.bash
-```
-
----
-
-### 定位模式（加载已有地图）
-
-已有 `~/.ros/rtabmap.db` 时，无需重新建图，直接加载定位：
-
-```bash
-ros2 launch wheeltec_robot_rtab wheeltec_slam_rtab.launch.py Localization:=true
 ```
 
 ---
 
 ## 物体导航
 
-`object_navigator_node` 订阅 `/navigate_to_object/goal`（String，物体类别名），在语义地图中查找目标，调用 Nav2 导航过去。找不到时自动触发前沿探索（发布 `/explore/resume = true`），探索中持续监视地图直到发现目标或超时。
+`object_navigator_node` 订阅 `/navigate_to_object/goal`（String，物体类别名），在语义地图中查找目标，调用 Nav2 导航过去。
+
+- **方式四B**：启动即可使用——语义地图已从 JSON 预加载，目标物体通常直接在地图中可见，机器人立即导航。
+- **方式四A**：地图为空时自动触发前沿探索（发布 `/explore/resume = true`），探索中持续监视地图直到发现目标或超时。
 
 > **前置条件**：使用方式四启动时，`frontier_explorer_node` 已内置于 `wheeltec_explore_rtab.launch.py` 中，无需单独启动。
 
@@ -195,13 +230,15 @@ http://<robot_ip>:8080
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `target_frame` | `map` | 语义对象的目标坐标系 |
-| `detection_topic` | `/yolo/detections_3d` | YOLO 3D 检测输入话题 |
+| `detection_topic` | `/detections_3d` | YOLO 3D 检测输入话题 |
 | `map_topic` | `/map` | 占用栅格地图输入话题 |
-| `object_timeout` | `120.0` s | 预留参数，当前未实现；物体清除依赖主动消失检测 |
+| `object_timeout` | `120.0` s | 超过此时间未被检测到的物体自动删除；`0` = 禁用（定位模式默认） |
 | `min_score` | `0.8` | 最低检测置信度，低于此值丢弃 |
 | `publish_rate` | `2.0` Hz | 语义地图输出刷新频率 |
-| `marker_lifetime` | `2.0` s | RViz 标注的可见持续时长（超时自动消失） |
 | `merge_distance` | `0.6` m | 空间去重半径，范围内同类物体合并为一个 |
+| `semantic_map_file` | `~/.ros/semantic_map.json` | 语义地图持久化路径（保存/加载） |
+| `load_on_startup` | `false` | 启动时从文件加载已保存的语义对象（定位模式设为 `true`） |
+| `autosave_period` | `0.0` s | 定期自动保存间隔；`0` = 仅在关闭时保存 |
 
 ### object_navigator_node 节点参数
 
@@ -256,7 +293,6 @@ http://<robot_ip>:8080
 
 | 显示类型 | 话题 | 说明 |
 |---------|------|------|
-| `MarkerArray` | `/semantic_map/markers` | 3D 彩色贴地方块 + 文字标签 |
 | `Image` | `/semantic_map/image` | 带语义标注的 2D 占用栅格俯视图 |
 | `Map` | `/map` | 原始占用栅格地图 |
 | `PointCloud2` | `/rtabmap/cloud_map` | RTAB-Map 3D 点云地图 |
@@ -347,7 +383,7 @@ EOF
 
 | 话题 | 类型 | 节点 |
 |------|------|------|
-| `/yolo/detections_3d` | `yolo_msgs/DetectionArray` | `semantic_map_node` |
+| `/detections_3d` | `yolo_msgs/DetectionArray` | `semantic_map_node` |
 | `/map` | `nav_msgs/OccupancyGrid` | `semantic_map_node`, `frontier_explorer_node` |
 | `/navigate_to_object/goal` | `std_msgs/String` | `object_navigator_node`（物体类别名） |
 | `/navigate_to_object/cancel` | `std_msgs/Empty` | `object_navigator_node`（取消当前任务） |
@@ -358,7 +394,6 @@ EOF
 
 | 话题 | 类型 | 节点 | 说明 |
 |------|------|------|------|
-| `/semantic_map/markers` | `visualization_msgs/MarkerArray` | `semantic_map_node` | RViz 3D 贴地方块 + 文字标注 |
 | `/semantic_map/image` | `sensor_msgs/Image` (bgr8) | `semantic_map_node` | 2D 标注地图图像 |
 | `/semantic_map/objects` | `std_msgs/String` (JSON) | `semantic_map_node` | 当前地图中所有物体的列表 |
 | `/navigate_to_object/feedback` | `std_msgs/String` (JSON) | `object_navigator_node` | 导航任务实时状态 |
@@ -370,13 +405,14 @@ EOF
 ### 验证话题输出
 
 ```bash
-# 查看语义对象数量（每次刷新应有数据）
-ros2 topic echo /semantic_map/markers --once
+# 查看语义对象列表（每次刷新应有数据）
+ros2 topic echo /semantic_map/objects --once
 
 # 查看话题频率
-ros2 topic hz /semantic_map/markers
+ros2 topic hz /semantic_map/image
+ros2 topic hz /semantic_map/objects
 ros2 topic hz /rgbd_image
-ros2 topic hz /yolo/detections_3d
+ros2 topic hz /detections_3d
 
 # 确认探索节点已收到地图（方式四）
 ros2 topic echo /explore/frontiers --once
