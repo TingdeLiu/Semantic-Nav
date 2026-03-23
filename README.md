@@ -2,6 +2,11 @@
 
 将 YOLO v8 三维目标检测与 RTAB-Map SLAM 融合，在机器人导航地图上构建持久化语义标注层。检测到的物体以彩色贴地方块 + 文字标签的形式叠加到占用栅格地图上，支持 RViz 3D 可视化、2D 标注图像、JSON 物体列表三种输出。在此基础上，`object_navigator_node` 可接收目标类别名称，自动在语义地图中搜索并驱动 Nav2 导航到该物体；若未找到，则通过内置的 `frontier_explorer_node` 自主探索环境（仅追踪相机前向 ±90° 的前沿，确保语义地图不漏检）。
 
+<div align="center">
+  <img src="semantic_map_0000.png" width="60%" />
+  <figcaption>语义地图示例：检测到的物体以彩色编号方块叠加在占用栅格地图上，右侧图例显示类别与颜色对应关系</figcaption>
+</div>
+
 ---
 
 ## 目录
